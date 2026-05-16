@@ -75,6 +75,7 @@ void ggml_compute_forward_pool_1d(const struct ggml_compute_params * params, str
 void ggml_compute_forward_pool_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_upscale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_grid_sample_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_pad(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_pad_reflect_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);

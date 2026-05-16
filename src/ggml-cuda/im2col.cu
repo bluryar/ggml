@@ -8,7 +8,10 @@ static  __global__ void im2col_kernel(
         int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
         int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
         int s0, int s1, int p0, int p1, int d0, int d1) {
-    const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int64_t num_blocks = gridDim.x / OW;
+    const int64_t iow = blockIdx.x / num_blocks;
+    const int64_t ib  = blockIdx.x - iow * num_blocks;
+    const int64_t i = threadIdx.x + ib * blockDim.x;
     if (i >= IC_KH_KW) {
         return;
     }
@@ -18,7 +21,6 @@ static  __global__ void im2col_kernel(
     const int64_t ikh = rem / KW;
     const int64_t ikw = rem - ikh * KW;
 
-    const int64_t  iow = blockIdx.y;
     for (int64_t iz = blockIdx.z; iz < N_OH; iz+=MAX_GRIDDIM_Z) {
         const int64_t  in = iz / OH;
         const int64_t  ioh = iz - in * OH;
@@ -51,7 +53,7 @@ static void im2col_cuda(const float * x, T* dst,
     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
-    dim3 block_nums(num_blocks, OW, MIN(N_OH, MAX_GRIDDIM_Z));
+    dim3 block_nums(num_blocks * OW, 1, MIN(N_OH, MAX_GRIDDIM_Z));
     im2col_kernel<<<block_nums, MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
                                                                                      IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
                                                                                      s0, s1, p0, p1, d0, d1);

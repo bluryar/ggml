@@ -1928,6 +1928,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_upscale(params, tensor);
             } break;
+        case GGML_OP_GRID_SAMPLE_2D:
+            {
+                ggml_compute_forward_grid_sample_2d(params, tensor);
+            } break;
         case GGML_OP_PAD:
             {
                 ggml_compute_forward_pad(params, tensor);
@@ -2339,6 +2343,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = 1;
             } break;
         case GGML_OP_UPSCALE:
+        case GGML_OP_GRID_SAMPLE_2D:
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ROLL:

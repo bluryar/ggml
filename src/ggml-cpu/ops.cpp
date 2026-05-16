@@ -7736,6 +7736,114 @@ void ggml_compute_forward_upscale(
     }
 }
 
+// ggml_compute_forward_grid_sample_2d
+
+static inline float ggml_grid_sample_2d_coord(float coord, int64_t size, bool align_corners) {
+    if (std::isnan(coord)) {
+        coord = -1.0f;
+    }
+
+    if (align_corners) {
+        return 0.5f*(coord + 1.0f)*(float)(size - 1);
+    }
+
+    return 0.5f*(coord + 1.0f)*(float)size - 0.5f;
+}
+
+static inline float ggml_grid_sample_2d_get_f32(
+        const ggml_tensor * src,
+        int64_t             x,
+        int64_t             y,
+        int64_t             channel,
+        int64_t             batch) {
+    if (x < 0 || x >= src->ne[0] || y < 0 || y >= src->ne[1]) {
+        return 0.0f;
+    }
+
+    return *(const float *)((const char *) src->data + x*src->nb[0] + y*src->nb[1] + channel*src->nb[2] + batch*src->nb[3]);
+}
+
+static void ggml_compute_forward_grid_sample_2d_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * grid = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(grid->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(grid->ne[0] == 2);
+    GGML_ASSERT(grid->ne[1] == dst->ne[0]);
+    GGML_ASSERT(grid->ne[2] == dst->ne[1]);
+    GGML_ASSERT(grid->ne[3] == dst->ne[3]);
+    GGML_ASSERT(src0->ne[2] == dst->ne[2]);
+    GGML_ASSERT(src0->ne[3] == dst->ne[3]);
+
+    const enum ggml_grid_sample_mode mode = (enum ggml_grid_sample_mode) ggml_get_op_params_i32(dst, 0);
+    const enum ggml_grid_sample_padding padding = (enum ggml_grid_sample_padding) ggml_get_op_params_i32(dst, 1);
+    const bool align_corners = ggml_get_op_params_i32(dst, 2) != 0;
+
+    GGML_ASSERT(mode == GGML_GRID_SAMPLE_MODE_BILINEAR);
+    GGML_ASSERT(padding == GGML_GRID_SAMPLE_PADDING_ZEROS);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n = ggml_nelements(dst);
+
+    for (int64_t i = ith; i < n; i += nth) {
+        const int64_t x_out = i % dst->ne[0];
+        const int64_t y_out = (i / dst->ne[0]) % dst->ne[1];
+        const int64_t channel = (i / (dst->ne[0]*dst->ne[1])) % dst->ne[2];
+        const int64_t batch = i / (dst->ne[0]*dst->ne[1]*dst->ne[2]);
+
+        const float grid_x = *(const float *)((const char *) grid->data + 0*grid->nb[0] + x_out*grid->nb[1] + y_out*grid->nb[2] + batch*grid->nb[3]);
+        const float grid_y = *(const float *)((const char *) grid->data + 1*grid->nb[0] + x_out*grid->nb[1] + y_out*grid->nb[2] + batch*grid->nb[3]);
+
+        const float x_src = ggml_grid_sample_2d_coord(grid_x, src0->ne[0], align_corners);
+        const float y_src = ggml_grid_sample_2d_coord(grid_y, src0->ne[1], align_corners);
+
+        const int64_t x0 = (int64_t) floorf(x_src);
+        const int64_t y0 = (int64_t) floorf(y_src);
+        const int64_t x1 = x0 + 1;
+        const int64_t y1 = y0 + 1;
+
+        const float dx = x_src - (float) x0;
+        const float dy = y_src - (float) y0;
+
+        const float v00 = ggml_grid_sample_2d_get_f32(src0, x0, y0, channel, batch);
+        const float v01 = ggml_grid_sample_2d_get_f32(src0, x0, y1, channel, batch);
+        const float v10 = ggml_grid_sample_2d_get_f32(src0, x1, y0, channel, batch);
+        const float v11 = ggml_grid_sample_2d_get_f32(src0, x1, y1, channel, batch);
+
+        const float value =
+            v00*(1.0f - dx)*(1.0f - dy) +
+            v10*dx*(1.0f - dy) +
+            v01*(1.0f - dx)*dy +
+            v11*dx*dy;
+
+        *(float *)((char *) dst->data + x_out*dst->nb[0] + y_out*dst->nb[1] + channel*dst->nb[2] + batch*dst->nb[3]) = value;
+    }
+}
+
+void ggml_compute_forward_grid_sample_2d(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_grid_sample_2d_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 // ggml_compute_forward_pad
 

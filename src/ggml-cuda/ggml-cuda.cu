@@ -24,6 +24,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/grid-sample.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -2240,7 +2241,730 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+struct ggml_cuda_non_fa_attention_core_match {
+    const ggml_tensor * q_attn_in;
+    const ggml_tensor * k_attn_in;
+    const ggml_tensor * v_for_mm;
+    const ggml_tensor * kq;
+    const ggml_tensor * softmax;
+    const ggml_tensor * kqv;
+    const ggml_tensor * kq_mask;
+    float scale;
+};
+
+static bool ggml_cuda_match_non_fa_attention_core(
+        const ggml_tensor * dst,
+        ggml_cuda_non_fa_attention_core_match * match) {
+    if (dst == nullptr || dst->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const ggml_tensor * v_for_mm = dst->src[0];
+    const ggml_tensor * softmax  = dst->src[1];
+    if (v_for_mm == nullptr || softmax == nullptr || softmax->op != GGML_OP_SOFT_MAX) {
+        return false;
+    }
+
+    const ggml_tensor * kq_mask = softmax->src[1];
+    if (kq_mask == nullptr || kq_mask->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const float scale    = ggml_get_op_params_f32(softmax, 0);
+    const float max_bias = ggml_get_op_params_f32(softmax, 1);
+    if (max_bias != 0.0f) {
+        return false;
+    }
+
+    const ggml_tensor * kq = softmax->src[0];
+    if (kq == nullptr || kq->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const ggml_tensor * k_attn_in = kq->src[0];
+    const ggml_tensor * q_attn_in = kq->src[1];
+    if (q_attn_in == nullptr || k_attn_in == nullptr) {
+        return false;
+    }
+
+    if (dst->type != GGML_TYPE_F32 || kq->type != GGML_TYPE_F32 || softmax->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (q_attn_in->ne[0] != k_attn_in->ne[0]) {
+        return false;
+    }
+    if (q_attn_in->ne[2] != k_attn_in->ne[2] || q_attn_in->ne[3] != k_attn_in->ne[3]) {
+        return false;
+    }
+    if (kq->ne[0] != k_attn_in->ne[1] || kq->ne[1] != q_attn_in->ne[1]) {
+        return false;
+    }
+    if (kq->ne[2] != q_attn_in->ne[2] || kq->ne[3] != q_attn_in->ne[3]) {
+        return false;
+    }
+    if (softmax->ne[0] != kq->ne[0] || softmax->ne[1] != kq->ne[1] ||
+        softmax->ne[2] != kq->ne[2] || softmax->ne[3] != kq->ne[3]) {
+        return false;
+    }
+    if (v_for_mm->ne[0] != k_attn_in->ne[1] || v_for_mm->ne[1] != q_attn_in->ne[0]) {
+        return false;
+    }
+    if (v_for_mm->ne[2] != q_attn_in->ne[2] || v_for_mm->ne[3] != q_attn_in->ne[3]) {
+        return false;
+    }
+    if (dst->ne[0] != v_for_mm->ne[1] || dst->ne[1] != q_attn_in->ne[1]) {
+        return false;
+    }
+    if (dst->ne[2] != q_attn_in->ne[2] || dst->ne[3] != q_attn_in->ne[3]) {
+        return false;
+    }
+
+    if (match != nullptr) {
+        match->q_attn_in = q_attn_in;
+        match->k_attn_in = k_attn_in;
+        match->v_for_mm  = v_for_mm;
+        match->kq        = kq;
+        match->softmax   = softmax;
+        match->kqv       = dst;
+        match->kq_mask   = kq_mask;
+        match->scale     = scale;
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_debug_non_fa_attention_core() {
+    static const bool enabled = getenv("GGML_CUDA_DEBUG_NON_FA_ATTENTION_CORE") != nullptr;
+    return enabled;
+}
+
+static bool ggml_cuda_fuse_non_fa_attention_core() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_NON_FA_ATTENTION_CORE") != nullptr;
+    return enabled;
+}
+
+static bool ggml_cuda_use_non_fa_attention_core_kernel() {
+    static const bool enabled = getenv("GGML_CUDA_NON_FA_ATTENTION_CORE_KERNEL") != nullptr;
+    return enabled;
+}
+
+static bool ggml_cuda_use_non_fa_attention_core_tiled_kernel() {
+    static const bool enabled = getenv("GGML_CUDA_NON_FA_ATTENTION_CORE_TILED") != nullptr;
+    return enabled;
+}
+
+static int ggml_cuda_non_fa_attention_core_tiled_key_warps() {
+    const char * env = getenv("GGML_CUDA_NON_FA_ATTENTION_CORE_TILED_KEY_WARPS");
+    if (env == nullptr) {
+        return 4;
+    }
+
+    const int key_warps = atoi(env);
+    return key_warps == 1 || key_warps == 2 || key_warps == 4 || key_warps == 8 ? key_warps : 4;
+}
+
+static int64_t ggml_cuda_non_fa_attention_core_tiled_max_kv() {
+    const char * env = getenv("GGML_CUDA_NON_FA_ATTENTION_CORE_TILED_MAX_KV");
+    if (env == nullptr) {
+        return 0;
+    }
+
+    const int64_t max_kv = atoll(env);
+    return max_kv > 0 ? max_kv : 0;
+}
+
+static bool ggml_cuda_non_fa_attention_core_tiled_stats_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_NON_FA_ATTENTION_CORE_TILED_STATS") != nullptr;
+    return enabled;
+}
+
+enum class ggml_cuda_non_fa_attention_core_tiled_stat_reason {
+    fallback_disabled,
+    fallback_precondition,
+    fallback_max_kv,
+    hit,
+};
+
+struct ggml_cuda_non_fa_attention_core_tiled_stat_key {
+    int64_t kv;
+    int64_t q;
+    int64_t head;
+    int64_t batch;
+
+    bool operator<(const ggml_cuda_non_fa_attention_core_tiled_stat_key & other) const {
+        if (kv != other.kv) {
+            return kv < other.kv;
+        }
+        if (q != other.q) {
+            return q < other.q;
+        }
+        if (head != other.head) {
+            return head < other.head;
+        }
+        return batch < other.batch;
+    }
+};
+
+struct ggml_cuda_non_fa_attention_core_tiled_stat_counts {
+    int64_t total                 = 0;
+    int64_t fallback_disabled     = 0;
+    int64_t fallback_precondition = 0;
+    int64_t fallback_max_kv       = 0;
+    int64_t hit                   = 0;
+};
+
+static std::mutex & ggml_cuda_non_fa_attention_core_tiled_stats_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::map<ggml_cuda_non_fa_attention_core_tiled_stat_key, ggml_cuda_non_fa_attention_core_tiled_stat_counts> &
+ggml_cuda_non_fa_attention_core_tiled_stats() {
+    static std::map<ggml_cuda_non_fa_attention_core_tiled_stat_key, ggml_cuda_non_fa_attention_core_tiled_stat_counts> stats;
+    return stats;
+}
+
+struct ggml_cuda_non_fa_attention_core_tiled_stats_printer {
+    ~ggml_cuda_non_fa_attention_core_tiled_stats_printer() {
+        if (!ggml_cuda_non_fa_attention_core_tiled_stats_enabled()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(ggml_cuda_non_fa_attention_core_tiled_stats_mutex());
+        const auto & stats = ggml_cuda_non_fa_attention_core_tiled_stats();
+        if (stats.empty()) {
+            return;
+        }
+
+        const char * tag = "ggml_cuda_non_fa_attention_core_tiled_stats";
+        GGML_LOG_INFO(
+            "%s: non-FA attention core tiled stats by GGML shape "
+            "(kv=K.ne1 q=Q.ne1 head=Q.ne2 batch=Q.ne3)\n",
+            tag);
+        for (const auto & item : stats) {
+            const auto & key    = item.first;
+            const auto & counts = item.second;
+            GGML_LOG_INFO(
+                "%s: kv=%" PRId64 " q=%" PRId64 " head=%" PRId64 " batch=%" PRId64
+                " total=%" PRId64 " hit=%" PRId64 " fallback_disabled=%" PRId64
+                " fallback_precondition=%" PRId64 " fallback_max_kv=%" PRId64 "\n",
+                tag,
+                key.kv,
+                key.q,
+                key.head,
+                key.batch,
+                counts.total,
+                counts.hit,
+                counts.fallback_disabled,
+                counts.fallback_precondition,
+                counts.fallback_max_kv);
+        }
+    }
+};
+
+static ggml_cuda_non_fa_attention_core_tiled_stats_printer &
+ggml_cuda_non_fa_attention_core_tiled_stats_printer_instance() {
+    static ggml_cuda_non_fa_attention_core_tiled_stats_printer printer;
+    return printer;
+}
+
+static void ggml_cuda_record_non_fa_attention_core_tiled_stat(
+        const ggml_cuda_non_fa_attention_core_match & match,
+        const ggml_cuda_non_fa_attention_core_tiled_stat_reason reason) {
+    if (!ggml_cuda_non_fa_attention_core_tiled_stats_enabled()) {
+        return;
+    }
+
+    (void) ggml_cuda_non_fa_attention_core_tiled_stats_mutex();
+    (void) ggml_cuda_non_fa_attention_core_tiled_stats();
+    (void) ggml_cuda_non_fa_attention_core_tiled_stats_printer_instance();
+
+    const ggml_cuda_non_fa_attention_core_tiled_stat_key key = {
+        match.k_attn_in->ne[1],
+        match.q_attn_in->ne[1],
+        match.q_attn_in->ne[2],
+        match.q_attn_in->ne[3],
+    };
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_non_fa_attention_core_tiled_stats_mutex());
+    auto & counts = ggml_cuda_non_fa_attention_core_tiled_stats()[key];
+    counts.total++;
+
+    switch (reason) {
+        case ggml_cuda_non_fa_attention_core_tiled_stat_reason::fallback_disabled:
+            counts.fallback_disabled++;
+            break;
+        case ggml_cuda_non_fa_attention_core_tiled_stat_reason::fallback_precondition:
+            counts.fallback_precondition++;
+            break;
+        case ggml_cuda_non_fa_attention_core_tiled_stat_reason::fallback_max_kv:
+            counts.fallback_max_kv++;
+            break;
+        case ggml_cuda_non_fa_attention_core_tiled_stat_reason::hit:
+            counts.hit++;
+            break;
+    }
+}
+
+static void ggml_cuda_log_non_fa_attention_core_candidate(
+        const ggml_tensor * dst,
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    static std::atomic<int> remaining_logs = 4;
+    int expected = remaining_logs.load(std::memory_order_relaxed);
+    while (expected > 0) {
+        if (remaining_logs.compare_exchange_weak(expected, expected - 1, std::memory_order_relaxed)) {
+            GGML_LOG_INFO(
+                "%s: candidate dst=%s q=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "k=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "v=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "kq=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] scale=%g\n",
+                __func__,
+                dst->name ? dst->name : "(unnamed)",
+                match.q_attn_in->ne[0], match.q_attn_in->ne[1], match.q_attn_in->ne[2], match.q_attn_in->ne[3],
+                match.k_attn_in->ne[0], match.k_attn_in->ne[1], match.k_attn_in->ne[2], match.k_attn_in->ne[3],
+                match.v_for_mm->ne[0],  match.v_for_mm->ne[1],  match.v_for_mm->ne[2],  match.v_for_mm->ne[3],
+                match.kq->ne[0],        match.kq->ne[1],        match.kq->ne[2],        match.kq->ne[3],
+                match.scale);
+            return;
+        }
+    }
+}
+
+static void ggml_cuda_log_non_fa_attention_core_miss(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->name == nullptr || strstr(dst->name, "attn.kqv") == nullptr) {
+        return;
+    }
+
+    static std::atomic<int> remaining_logs = 4;
+    int expected = remaining_logs.load(std::memory_order_relaxed);
+    while (expected > 0) {
+        if (remaining_logs.compare_exchange_weak(expected, expected - 1, std::memory_order_relaxed)) {
+            const ggml_tensor * src0 = dst->src[0];
+            const ggml_tensor * src1 = dst->src[1];
+            GGML_LOG_INFO(
+                "%s: miss dst=%s op=%d src0=%s op=%d src1=%s op=%d mask=%p scale=%g max_bias=%g\n",
+                __func__,
+                dst->name,
+                (int) dst->op,
+                src0 && src0->name ? src0->name : "(unnamed)",
+                src0 ? (int) src0->op : -1,
+                src1 && src1->name ? src1->name : "(unnamed)",
+                src1 ? (int) src1->op : -1,
+                src1 ? (void *) src1->src[1] : nullptr,
+                src1 ? ggml_get_op_params_f32(src1, 0) : 0.0f,
+                src1 ? ggml_get_op_params_f32(src1, 1) : 0.0f);
+            return;
+        }
+    }
+}
+
+static bool ggml_cuda_match_non_fa_attention_core_subgraph(
+        const ggml_cgraph * cgraph,
+        const int node_idx,
+        ggml_cuda_non_fa_attention_core_match * match) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx,
+            { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT },
+            { node_idx + 2 })) {
+        return false;
+    }
+
+    const ggml_tensor * kqv     = cgraph->nodes[node_idx + 2];
+
+    if (!ggml_check_edges(cgraph, node_idx, {
+            { 1, 0, 0 },  // softmax.src[0] = kq
+            { 2, 1, 1 },  // kqv.src[1] = softmax
+        })) {
+        return false;
+    }
+
+    return ggml_cuda_match_non_fa_attention_core(kqv, match);
+}
+
+static void ggml_cuda_log_non_fa_attention_core_fusion_candidate(
+        const ggml_tensor * dst,
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    static std::atomic<int> remaining_logs = 4;
+    int expected = remaining_logs.load(std::memory_order_relaxed);
+    while (expected > 0) {
+        if (remaining_logs.compare_exchange_weak(expected, expected - 1, std::memory_order_relaxed)) {
+            GGML_LOG_INFO(
+                "%s: graph-level candidate dst=%s q=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "k=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "v=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "kq=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] scale=%g\n",
+                __func__,
+                dst->name ? dst->name : "(unnamed)",
+                match.q_attn_in->ne[0], match.q_attn_in->ne[1], match.q_attn_in->ne[2], match.q_attn_in->ne[3],
+                match.k_attn_in->ne[0], match.k_attn_in->ne[1], match.k_attn_in->ne[2], match.k_attn_in->ne[3],
+                match.v_for_mm->ne[0],  match.v_for_mm->ne[1],  match.v_for_mm->ne[2],  match.v_for_mm->ne[3],
+                match.kq->ne[0],        match.kq->ne[1],        match.kq->ne[2],        match.kq->ne[3],
+                match.scale);
+            return;
+        }
+    }
+}
+
+struct ggml_cuda_non_fa_attention_core_params {
+    int64_t head_dim;
+    int64_t n_kv;
+    int64_t n_q;
+    int64_t n_head;
+    int64_t n_batch;
+    int64_t q_nb0;
+    int64_t q_nb1;
+    int64_t q_nb2;
+    int64_t q_nb3;
+    int64_t k_nb0;
+    int64_t k_nb1;
+    int64_t k_nb2;
+    int64_t k_nb3;
+    int64_t v_nb0;
+    int64_t v_nb1;
+    int64_t v_nb2;
+    int64_t v_nb3;
+    int64_t mask_nb0;
+    int64_t mask_nb1;
+    int64_t mask_nb2;
+    int64_t mask_nb3;
+    int64_t mask_ne2;
+    int64_t mask_ne3;
+    int64_t dst_nb0;
+    int64_t dst_nb1;
+    int64_t dst_nb2;
+    int64_t dst_nb3;
+    float scale;
+};
+
+static ggml_cuda_non_fa_attention_core_params ggml_cuda_non_fa_attention_core_params_from_match(
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    const ggml_tensor * q    = match.q_attn_in;
+    const ggml_tensor * k    = match.k_attn_in;
+    const ggml_tensor * v    = match.v_for_mm;
+    const ggml_tensor * mask = match.kq_mask;
+    const ggml_tensor * dst  = match.kqv;
+
+    ggml_cuda_non_fa_attention_core_params params = {};
+    params.head_dim = q->ne[0];
+    params.n_kv     = k->ne[1];
+    params.n_q      = q->ne[1];
+    params.n_head   = q->ne[2];
+    params.n_batch  = q->ne[3];
+    params.q_nb0    = q->nb[0];
+    params.q_nb1    = q->nb[1];
+    params.q_nb2    = q->nb[2];
+    params.q_nb3    = q->nb[3];
+    params.k_nb0    = k->nb[0];
+    params.k_nb1    = k->nb[1];
+    params.k_nb2    = k->nb[2];
+    params.k_nb3    = k->nb[3];
+    params.v_nb0    = v->nb[0];
+    params.v_nb1    = v->nb[1];
+    params.v_nb2    = v->nb[2];
+    params.v_nb3    = v->nb[3];
+    params.mask_nb0 = mask->nb[0];
+    params.mask_nb1 = mask->nb[1];
+    params.mask_nb2 = mask->nb[2];
+    params.mask_nb3 = mask->nb[3];
+    params.mask_ne2 = mask->ne[2];
+    params.mask_ne3 = mask->ne[3];
+    params.dst_nb0  = dst->nb[0];
+    params.dst_nb1  = dst->nb[1];
+    params.dst_nb2  = dst->nb[2];
+    params.dst_nb3  = dst->nb[3];
+    params.scale    = match.scale;
+    return params;
+}
+
+static __global__ void non_fa_attention_core_f32_kernel(
+        const float * q,
+        const float * k,
+        const float * v,
+        const float * mask,
+        float * dst,
+        ggml_cuda_non_fa_attention_core_params p) {
+    const int64_t iq = blockIdx.x;
+    const int64_t ih = blockIdx.y;
+    const int64_t ib = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float * scores = smem;
+    float * reduce = smem + p.n_kv;
+
+    const int64_t mask_h = ih % p.mask_ne2;
+    const int64_t mask_b = ib % p.mask_ne3;
+
+    for (int64_t ik = 0; ik < p.n_kv; ++ik) {
+        float partial = 0.0f;
+        for (int64_t id = tid; id < p.head_dim; id += blockDim.x) {
+            const float qv = *(const float *) ((const char *) q + id*p.q_nb0 + iq*p.q_nb1 + ih*p.q_nb2 + ib*p.q_nb3);
+            const float kv = *(const float *) ((const char *) k + id*p.k_nb0 + ik*p.k_nb1 + ih*p.k_nb2 + ib*p.k_nb3);
+            partial += qv*kv;
+        }
+
+        reduce[tid] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce[tid] += reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const float mv = *(const float *) (
+                (const char *) mask + ik*p.mask_nb0 + iq*p.mask_nb1 + mask_h*p.mask_nb2 + mask_b*p.mask_nb3);
+            scores[ik] = reduce[0]*p.scale + mv;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float max_score = -INFINITY;
+        for (int64_t ik = 0; ik < p.n_kv; ++ik) {
+            max_score = fmaxf(max_score, scores[ik]);
+        }
+
+        float sum = 0.0f;
+        for (int64_t ik = 0; ik < p.n_kv; ++ik) {
+            const float prob = expf(scores[ik] - max_score);
+            scores[ik] = prob;
+            sum += prob;
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (int64_t ik = 0; ik < p.n_kv; ++ik) {
+            scores[ik] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    for (int64_t id = tid; id < p.head_dim; id += blockDim.x) {
+        float out = 0.0f;
+        for (int64_t ik = 0; ik < p.n_kv; ++ik) {
+            const float vv = *(const float *) ((const char *) v + ik*p.v_nb0 + id*p.v_nb1 + ih*p.v_nb2 + ib*p.v_nb3);
+            out += scores[ik]*vv;
+        }
+        *(float *) ((char *) dst + id*p.dst_nb0 + iq*p.dst_nb1 + ih*p.dst_nb2 + ib*p.dst_nb3) = out;
+    }
+}
+
+template<int key_warps>
+static __global__ void non_fa_attention_core_f32_tiled_kernel(
+        const float * q,
+        const float * k,
+        const float * v,
+        const float * mask,
+        float * dst,
+        ggml_cuda_non_fa_attention_core_params p) {
+    const int64_t iq = blockIdx.x;
+    const int64_t ih = blockIdx.y;
+    const int64_t ib = blockIdx.z;
+    const int tid  = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp = tid / WARP_SIZE;
+
+    extern __shared__ float scores[];
+
+    const int64_t mask_h = ih % p.mask_ne2;
+    const int64_t mask_b = ib % p.mask_ne3;
+
+    for (int64_t ik0 = 0; ik0 < p.n_kv; ik0 += key_warps) {
+        const int64_t ik = ik0 + warp;
+        float partial = 0.0f;
+        if (warp < key_warps && ik < p.n_kv) {
+            for (int64_t id = lane; id < p.head_dim; id += WARP_SIZE) {
+                const float qv = *(const float *) ((const char *) q + id*p.q_nb0 + iq*p.q_nb1 + ih*p.q_nb2 + ib*p.q_nb3);
+                const float kv = *(const float *) ((const char *) k + id*p.k_nb0 + ik*p.k_nb1 + ih*p.k_nb2 + ib*p.k_nb3);
+                partial += qv*kv;
+            }
+
+            const float dot = warp_reduce_sum(partial);
+            if (lane == 0) {
+                const float mv = *(const float *) (
+                    (const char *) mask + ik*p.mask_nb0 + iq*p.mask_nb1 + mask_h*p.mask_nb2 + mask_b*p.mask_nb3);
+                scores[ik] = dot*p.scale + mv;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float max_score = -INFINITY;
+        for (int64_t ik = lane; ik < p.n_kv; ik += WARP_SIZE) {
+            max_score = fmaxf(max_score, scores[ik]);
+        }
+        max_score = warp_reduce_max(max_score);
+
+        float sum = 0.0f;
+        for (int64_t ik = lane; ik < p.n_kv; ik += WARP_SIZE) {
+            const float prob = expf(scores[ik] - max_score);
+            scores[ik] = prob;
+            sum += prob;
+        }
+        sum = warp_reduce_sum(sum);
+
+        const float inv_sum = 1.0f / sum;
+        for (int64_t ik = lane; ik < p.n_kv; ik += WARP_SIZE) {
+            scores[ik] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    for (int64_t id = tid; id < p.head_dim; id += blockDim.x) {
+        float out = 0.0f;
+        for (int64_t ik = 0; ik < p.n_kv; ++ik) {
+            const float vv = *(const float *) ((const char *) v + ik*p.v_nb0 + id*p.v_nb1 + ih*p.v_nb2 + ib*p.v_nb3);
+            out += scores[ik]*vv;
+        }
+        *(float *) ((char *) dst + id*p.dst_nb0 + iq*p.dst_nb1 + ih*p.dst_nb2 + ib*p.dst_nb3) = out;
+    }
+}
+
+static bool ggml_cuda_can_run_non_fa_attention_core_kernel(const ggml_cuda_non_fa_attention_core_match & match) {
+    const ggml_tensor * q    = match.q_attn_in;
+    const ggml_tensor * k    = match.k_attn_in;
+    const ggml_tensor * v    = match.v_for_mm;
+    const ggml_tensor * mask = match.kq_mask;
+    const ggml_tensor * dst  = match.kqv;
+
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+        mask->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (ggml_backend_buft_is_cuda_split(q->buffer->buft) ||
+        ggml_backend_buft_is_cuda_split(k->buffer->buft) ||
+        ggml_backend_buft_is_cuda_split(v->buffer->buft) ||
+        ggml_backend_buft_is_cuda_split(mask->buffer->buft) ||
+        ggml_backend_buft_is_cuda_split(dst->buffer->buft)) {
+        return false;
+    }
+
+    if (q->ne[0] <= 0 || q->ne[1] <= 0 || q->ne[2] <= 0 || q->ne[3] <= 0) {
+        return false;
+    }
+    if (mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] || mask->ne[2] <= 0 || mask->ne[3] <= 0) {
+        return false;
+    }
+
+    const int block_size = 256;
+    const size_t nbytes_shared = (size_t) (k->ne[1] + block_size)*sizeof(float);
+    return nbytes_shared <= 48*1024;
+}
+
+static bool ggml_cuda_try_non_fa_attention_core_kernel(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    if (!ggml_cuda_use_non_fa_attention_core_kernel()) {
+        return false;
+    }
+
+    if (!ggml_cuda_can_run_non_fa_attention_core_kernel(match)) {
+        return false;
+    }
+
+    const ggml_tensor * q    = match.q_attn_in;
+    const ggml_tensor * k    = match.k_attn_in;
+    const ggml_tensor * v    = match.v_for_mm;
+    const ggml_tensor * mask = match.kq_mask;
+    const ggml_tensor * dst  = match.kqv;
+
+    const int block_size = 256;
+    const size_t nbytes_shared = (size_t) (k->ne[1] + block_size)*sizeof(float);
+    const dim3 block_nums(q->ne[1], q->ne[2], q->ne[3]);
+    const dim3 block_dims(block_size, 1, 1);
+
+    const ggml_cuda_non_fa_attention_core_params params = ggml_cuda_non_fa_attention_core_params_from_match(match);
+
+    non_fa_attention_core_f32_kernel<<<block_nums, block_dims, nbytes_shared, ctx.stream()>>>(
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) mask->data,
+        (float *) dst->data,
+        params);
+    return true;
+}
+
+template<int key_warps>
+static void ggml_cuda_launch_non_fa_attention_core_tiled_kernel(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    const ggml_tensor * q    = match.q_attn_in;
+    const ggml_tensor * k    = match.k_attn_in;
+    const ggml_tensor * v    = match.v_for_mm;
+    const ggml_tensor * mask = match.kq_mask;
+    const ggml_tensor * dst  = match.kqv;
+
+    const int block_size = key_warps*WARP_SIZE;
+    const size_t nbytes_shared = (size_t) k->ne[1]*sizeof(float);
+    const dim3 block_nums(q->ne[1], q->ne[2], q->ne[3]);
+    const dim3 block_dims(block_size, 1, 1);
+    const ggml_cuda_non_fa_attention_core_params params = ggml_cuda_non_fa_attention_core_params_from_match(match);
+
+    non_fa_attention_core_f32_tiled_kernel<key_warps><<<block_nums, block_dims, nbytes_shared, ctx.stream()>>>(
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) mask->data,
+        (float *) dst->data,
+        params);
+}
+
+static bool ggml_cuda_try_non_fa_attention_core_tiled_kernel(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    if (!ggml_cuda_use_non_fa_attention_core_tiled_kernel()) {
+        ggml_cuda_record_non_fa_attention_core_tiled_stat(
+            match, ggml_cuda_non_fa_attention_core_tiled_stat_reason::fallback_disabled);
+        return false;
+    }
+
+    if (!ggml_cuda_can_run_non_fa_attention_core_kernel(match)) {
+        ggml_cuda_record_non_fa_attention_core_tiled_stat(
+            match, ggml_cuda_non_fa_attention_core_tiled_stat_reason::fallback_precondition);
+        return false;
+    }
+
+    const int64_t max_kv = ggml_cuda_non_fa_attention_core_tiled_max_kv();
+    if (max_kv > 0 && match.k_attn_in->ne[1] > max_kv) {
+        ggml_cuda_record_non_fa_attention_core_tiled_stat(
+            match, ggml_cuda_non_fa_attention_core_tiled_stat_reason::fallback_max_kv);
+        return false;
+    }
+
+    switch (ggml_cuda_non_fa_attention_core_tiled_key_warps()) {
+        case 1:
+            ggml_cuda_launch_non_fa_attention_core_tiled_kernel<1>(ctx, match);
+            break;
+        case 2:
+            ggml_cuda_launch_non_fa_attention_core_tiled_kernel<2>(ctx, match);
+            break;
+        case 8:
+            ggml_cuda_launch_non_fa_attention_core_tiled_kernel<8>(ctx, match);
+            break;
+        case 4:
+        default:
+            ggml_cuda_launch_non_fa_attention_core_tiled_kernel<4>(ctx, match);
+            break;
+    }
+    ggml_cuda_record_non_fa_attention_core_tiled_stat(
+        match, ggml_cuda_non_fa_attention_core_tiled_stat_reason::hit);
+    return true;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_non_fa_attention_core_match non_fa_attention_core = {};
+    if (ggml_cuda_debug_non_fa_attention_core()) {
+        if (ggml_cuda_match_non_fa_attention_core(dst, &non_fa_attention_core)) {
+            ggml_cuda_log_non_fa_attention_core_candidate(dst, non_fa_attention_core);
+        } else {
+            ggml_cuda_log_non_fa_attention_core_miss(dst);
+        }
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2652,6 +3376,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_UPSCALE:
             ggml_cuda_op_upscale(ctx, dst);
+            break;
+        case GGML_OP_GRID_SAMPLE_2D:
+            ggml_cuda_op_grid_sample_2d(ctx, dst);
             break;
         case GGML_OP_PAD:
             ggml_cuda_op_pad(ctx, dst);
@@ -3160,6 +3887,30 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     }
 
     return true;
+}
+
+static void ggml_cuda_op_non_fa_attention_core_fused(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * kq,
+        ggml_tensor * softmax,
+        ggml_tensor * kqv,
+        const ggml_cuda_non_fa_attention_core_match & match) {
+    // Dev-only graph-level fusion: execute an explicit F32 attention core kernel
+    // when the matched GGML tensors satisfy its narrow boundary, otherwise keep
+    // the original three-node MUL_MAT -> SOFT_MAX -> MUL_MAT execution.
+    if (ggml_cuda_try_non_fa_attention_core_tiled_kernel(ctx, match)) {
+        return;
+    }
+    if (ggml_cuda_try_non_fa_attention_core_kernel(ctx, match)) {
+        return;
+    }
+
+    bool ok = ggml_cuda_compute_forward(ctx, kq);
+    GGML_ASSERT(ok);
+    ok = ggml_cuda_compute_forward(ctx, softmax);
+    GGML_ASSERT(ok);
+    ok = ggml_cuda_compute_forward(ctx, kqv);
+    GGML_ASSERT(ok);
 }
 
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
@@ -3756,6 +4507,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                     continue;
                                 }
                             }
+                        }
+                    }
+
+                    if (ggml_cuda_fuse_non_fa_attention_core()) {
+                        ggml_cuda_non_fa_attention_core_match attention_core = {};
+                        if (ggml_cuda_match_non_fa_attention_core_subgraph(cgraph, i, &attention_core)) {
+                            ggml_tensor * kq      = cgraph->nodes[i];
+                            ggml_tensor * softmax = cgraph->nodes[i + 1];
+                            ggml_tensor * kqv     = cgraph->nodes[i + 2];
+
+                            if (ggml_cuda_debug_non_fa_attention_core()) {
+                                ggml_cuda_log_non_fa_attention_core_fusion_candidate(kqv, attention_core);
+                            }
+
+                            ggml_cuda_op_non_fa_attention_core_fused(*cuda_ctx, kq, softmax, kqv, attention_core);
+                            i += 2;
+                            continue;
                         }
                     }
 
@@ -5029,6 +5797,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PAD:
             return true;
         case GGML_OP_UPSCALE:
+        case GGML_OP_GRID_SAMPLE_2D:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:
