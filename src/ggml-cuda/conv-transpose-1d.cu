@@ -15,22 +15,17 @@ static  __global__ void conv_transpose_1d_kernel(
 
     float accumulator = 0;
 
+    const int idx = global_index % dst_ne0;
+    const int i_min = max(0, (idx - src0_ne0 + s0) / s0);
+    const int i_max = min(src1_ne0 - 1, idx / s0);
+
     for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
+        const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+        const int input_offset = src1_ne0 * c;
 
-        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        int input_offset = src1_ne0 * c;
-
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
-            }
-            int weight_idx = idx - i*s0;
-
-            float kernel_weight = src0[kernel_offset + weight_idx];
-            float input_value =  src1[input_offset+i];
-
-            accumulator += kernel_weight * input_value;
+        for (int i = i_min; i <= i_max; i++) {
+            const int weight_idx = idx - i*s0;
+            accumulator += src0[kernel_offset + weight_idx] * src1[input_offset+i];
         }
     }
     dst[global_index] = accumulator;
