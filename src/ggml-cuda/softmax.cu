@@ -10,6 +10,8 @@
 #endif // GGML_USE_HIP
 
 #include <cstdint>
+#include <atomic>
+#include <cstdlib>
 #include <utility>
 
 template <typename T>
@@ -269,6 +271,148 @@ static __global__ void soft_max_back_f32(
     }
 }
 
+static bool ggml_cuda_use_masked_soft_max_small_f32() {
+    static const bool enabled = getenv("GGML_CUDA_MASKED_SOFT_MAX_SMALL") != nullptr;
+    return enabled;
+}
+
+static bool ggml_cuda_debug_masked_soft_max_small_f32() {
+    static const bool enabled = getenv("GGML_CUDA_DEBUG_MASKED_SOFT_MAX_SMALL") != nullptr;
+    return enabled;
+}
+
+static int ggml_cuda_masked_soft_max_small_warps_per_block() {
+    const char * env = getenv("GGML_CUDA_MASKED_SOFT_MAX_SMALL_WARPS");
+    if (env == nullptr) {
+        return 1;
+    }
+
+    const int warps = atoi(env);
+    return warps == 2 || warps == 4 || warps == 8 ? warps : 1;
+}
+
+template<int warps_per_block>
+static __global__ void soft_max_f32_masked_small(
+        const float * x, const float * mask, float * dst, const soft_max_params p) {
+    const int tid  = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp = tid / WARP_SIZE;
+
+    const int64_t row = int64_t(blockIdx.x)*warps_per_block + warp;
+    const int64_t nrows = p.ne01*p.ne02*p.ne03;
+    if (row >= nrows) {
+        return;
+    }
+
+    const int64_t i01 = row % p.ne01;
+    const int64_t tmp = row / p.ne01;
+    const int64_t i02 = tmp % p.ne02;
+    const int64_t i03 = tmp / p.ne02;
+
+    const int64_t i12 = i02 % p.ne12;
+    const int64_t i13 = i03 % p.ne13;
+
+    const float * x_row    = x + row*p.ncols;
+    const float * mask_row = (const float *) ((const char *) mask + i01*p.nb11 + i12*p.nb12 + i13*p.nb13);
+    float *       dst_row  = dst + row*p.ncols;
+
+    const float val = lane < p.ncols ? x_row[lane]*p.scale + mask_row[lane] : -INFINITY;
+    const float vmax = warp_reduce_max(val);
+    const float expv = lane < p.ncols ? expf(val - vmax) : 0.0f;
+    const float sum  = warp_reduce_sum(expv);
+
+    if (lane < p.ncols) {
+        dst_row[lane] = expv / sum;
+    }
+}
+
+template<int warps_per_block>
+static void soft_max_f32_masked_small_cuda(
+        const float * x, const float * mask, float * dst, const soft_max_params & params, cudaStream_t stream) {
+    const int64_t nrows = params.ne01*params.ne02*params.ne03;
+    const dim3 block_dims(warps_per_block*WARP_SIZE, 1, 1);
+    const dim3 block_nums((nrows + warps_per_block - 1) / warps_per_block, 1, 1);
+
+    soft_max_f32_masked_small<warps_per_block><<<block_nums, block_dims, 0, stream>>>(x, mask, dst, params);
+}
+
+static void soft_max_f32_masked_small_cuda(
+        const float * x, const float * mask, float * dst, const soft_max_params & params, cudaStream_t stream) {
+    switch (ggml_cuda_masked_soft_max_small_warps_per_block()) {
+        case 2:
+            soft_max_f32_masked_small_cuda<2>(x, mask, dst, params, stream);
+            break;
+        case 4:
+            soft_max_f32_masked_small_cuda<4>(x, mask, dst, params, stream);
+            break;
+        case 8:
+            soft_max_f32_masked_small_cuda<8>(x, mask, dst, params, stream);
+            break;
+        case 1:
+        default:
+            soft_max_f32_masked_small_cuda<1>(x, mask, dst, params, stream);
+            break;
+    }
+}
+
+static bool ggml_cuda_can_use_masked_soft_max_small_f32(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * src2,
+        const ggml_tensor * dst,
+        const float max_bias) {
+    if (!ggml_cuda_use_masked_soft_max_small_f32()) {
+        return false;
+    }
+
+    if (src1 == nullptr || src2 != nullptr) {
+        return false;
+    }
+
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (max_bias != 0.0f) {
+        return false;
+    }
+
+    if (src0->ne[0] <= 0 || src0->ne[0] > WARP_SIZE) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    if (src1->nb[0] != (int64_t) sizeof(float)) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_cuda_log_masked_soft_max_small_f32(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const float scale) {
+    static std::atomic<int> remaining_logs = 4;
+    int expected = remaining_logs.load(std::memory_order_relaxed);
+    while (expected > 0) {
+        if (remaining_logs.compare_exchange_weak(expected, expected - 1, std::memory_order_relaxed)) {
+            GGML_LOG_INFO(
+                "%s: dst=%s src0=[%lld, %lld, %lld, %lld] mask=[%lld, %lld, %lld, %lld] scale=%g\n",
+                __func__,
+                dst->name ? dst->name : "(unnamed)",
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                scale);
+            return;
+        }
+    }
+}
+
 template<int... Ns, typename T>
 static void launch_soft_max_kernels(const float * x, const T * mask, const float * sinks, float * dst,
                              const soft_max_params & p, cudaStream_t stream, dim3 block_dims, dim3 block_nums, size_t nbytes_shared)
@@ -435,6 +579,14 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     params.max_bias = max_bias;
     params.m0 = m0;
     params.m1 = m1;
+
+    if (ggml_cuda_can_use_masked_soft_max_small_f32(src0, src1, src2, dst, max_bias)) {
+        if (ggml_cuda_debug_masked_soft_max_small_f32()) {
+            ggml_cuda_log_masked_soft_max_small_f32(src0, src1, dst, scale);
+        }
+        soft_max_f32_masked_small_cuda(src0_d, (const float *) src1_d, dst_d, params, stream);
+        return;
+    }
 
     if (use_f16) {
         soft_max_f32_cuda(src0_d, (const half *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);

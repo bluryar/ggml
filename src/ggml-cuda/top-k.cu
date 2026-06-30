@@ -1,6 +1,10 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
@@ -48,6 +52,46 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
+static bool top_k_simple_enabled() {
+    const char * env = std::getenv("GGML_CUDA_TOP_K_SIMPLE");
+    return env != nullptr &&
+           (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0 ||
+            std::strcmp(env, "yes") == 0 || std::strcmp(env, "on") == 0);
+}
+
+static __global__ void top_k_simple_f32_i32(const float * __restrict__ src,
+                                            int * __restrict__ dst,
+                                            const int ncols,
+                                            const int k) {
+    const int row = blockIdx.x;
+    const float * row_src = src + int64_t(row)*ncols;
+    int * row_dst = dst + int64_t(row)*k;
+
+    for (int out = 0; out < k; ++out) {
+        float best = -INFINITY;
+        int best_col = -1;
+        for (int col = 0; col < ncols; ++col) {
+            bool already_selected = false;
+            for (int prev = 0; prev < out; ++prev) {
+                if (row_dst[prev] == col) {
+                    already_selected = true;
+                    break;
+                }
+            }
+            if (already_selected) {
+                continue;
+            }
+
+            const float value = row_src[col];
+            if (best_col < 0 || value > best || (value == best && col < best_col)) {
+                best = value;
+                best_col = col;
+            }
+        }
+        row_dst[out] = best_col;
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -63,6 +107,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
+    if (top_k_simple_enabled()) {
+        GGML_ASSERT(ncols <= INT_MAX);
+        GGML_ASSERT(nrows <= INT_MAX);
+        GGML_ASSERT(k <= INT_MAX);
+        top_k_simple_f32_i32<<<int(nrows), 1, 0, stream>>>(src0_d, dst_d, int(ncols), int(k));
+        return;
+    }
+
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391

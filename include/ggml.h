@@ -583,6 +583,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_GRID_SAMPLE_2D,
+
         GGML_OP_COUNT,
     };
 
@@ -2235,6 +2237,18 @@ extern "C" {
         GGML_SCALE_FLAG_ANTIALIAS     = (1 << 9),
     };
 
+    enum ggml_grid_sample_mode {
+        GGML_GRID_SAMPLE_MODE_BILINEAR = 0,
+
+        GGML_GRID_SAMPLE_MODE_COUNT
+    };
+
+    enum ggml_grid_sample_padding {
+        GGML_GRID_SAMPLE_PADDING_ZEROS = 0,
+
+        GGML_GRID_SAMPLE_PADDING_COUNT
+    };
+
     // interpolate
     // multiplies ne0 and ne1 by scale factor
     GGML_API struct ggml_tensor * ggml_upscale(
@@ -2265,6 +2279,18 @@ extern "C" {
             int64_t               ne2,
             int64_t               ne3,
             uint32_t              mode); // ggml_scale_mode [ | ggml_scale_flag...]
+
+    // 2D grid sample.
+    // input:  (ne0=W_in,  ne1=H_in,  ne2=C, ne3=N)
+    // grid:   (ne0=2,     ne1=W_out, ne2=H_out, ne3=N), normalized coordinates in (x, y) order
+    // result: (ne0=W_out, ne1=H_out, ne2=C, ne3=N)
+    GGML_API struct ggml_tensor * ggml_grid_sample_2d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * grid,
+            enum ggml_grid_sample_mode    mode,
+            enum ggml_grid_sample_padding padding,
+            bool                  align_corners);
 
     // pad each dimension with zeros: [x, ..., x] -> [x, ..., x, 0, ..., 0]
     GGML_API struct ggml_tensor * ggml_pad(

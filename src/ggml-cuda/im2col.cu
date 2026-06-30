@@ -9,7 +9,10 @@ static  __global__ void im2col_kernel(
         int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
         int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
         int s0, int s1, int p0, int p1, int d0, int d1) {
-    const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int64_t num_blocks = gridDim.x / OW;
+    const int64_t iow = blockIdx.x / num_blocks;
+    const int64_t ib  = blockIdx.x - iow * num_blocks;
+    const int64_t i = threadIdx.x + ib * blockDim.x;
     if (i >= IC_KH_KW) {
         return;
     }

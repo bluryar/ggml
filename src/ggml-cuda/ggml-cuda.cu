@@ -26,6 +26,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/grid-sample.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -90,6 +91,125 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+static bool ggml_cuda_mul_mat_profile_enabled() {
+    static const bool enabled = std::getenv("HIGGS_CUDA_MUL_MAT_PROFILE") != nullptr;
+    return enabled;
+}
+
+struct ggml_cuda_mul_mat_profile_entry {
+    long long count = 0;
+};
+
+static std::mutex & ggml_cuda_mul_mat_profile_mutex() {
+    static auto * mutex = new std::mutex();
+    return *mutex;
+}
+
+static std::map<std::string, ggml_cuda_mul_mat_profile_entry> & ggml_cuda_mul_mat_profile_entries() {
+    static auto * entries = new std::map<std::string, ggml_cuda_mul_mat_profile_entry>();
+    return *entries;
+}
+
+static void ggml_cuda_mul_mat_profile_print() {
+    if (!ggml_cuda_mul_mat_profile_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_mul_mat_profile_mutex());
+    for (const auto & item : ggml_cuda_mul_mat_profile_entries()) {
+        const ggml_cuda_mul_mat_profile_entry & e = item.second;
+        std::fprintf(stderr,
+                     "higgs_cuda_mul_mat_summary %s count=%lld\n",
+                     item.first.c_str(),
+                     e.count);
+    }
+}
+
+static void ggml_cuda_mul_mat_profile_record(const std::string & key) {
+    static const bool registered = [] {
+        std::atexit(ggml_cuda_mul_mat_profile_print);
+        return true;
+    }();
+    (void) registered;
+    std::lock_guard<std::mutex> lock(ggml_cuda_mul_mat_profile_mutex());
+    ggml_cuda_mul_mat_profile_entry & e = ggml_cuda_mul_mat_profile_entries()[key];
+    e.count += 1;
+}
+
+static std::string ggml_cuda_mul_mat_profile_key(const char * path, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    char buf[256];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "path=%s src0_type=%s src1_type=%s dst_type=%s prec=%d src0=%lldx%lldx%lldx%lld src1=%lldx%lldx%lldx%lld dst=%lldx%lldx%lldx%lld",
+                  path,
+                  ggml_type_name(src0->type),
+                  ggml_type_name(src1->type),
+                  ggml_type_name(dst->type),
+                  ggml_get_op_params_i32(dst, 0),
+                  (long long) src0->ne[0],
+                  (long long) src0->ne[1],
+                  (long long) src0->ne[2],
+                  (long long) src0->ne[3],
+                  (long long) src1->ne[0],
+                  (long long) src1->ne[1],
+                  (long long) src1->ne[2],
+                  (long long) src1->ne[3],
+                  (long long) dst->ne[0],
+                  (long long) dst->ne[1],
+                  (long long) dst->ne[2],
+                  (long long) dst->ne[3]);
+    return std::string(buf);
+}
+
+#ifdef USE_CUDA_GRAPH
+static void ggml_cuda_graph_profile_record(const char * state, int n_nodes) {
+    if (!ggml_cuda_mul_mat_profile_enabled()) {
+        return;
+    }
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "graph_state=%s n_nodes=%d", state, n_nodes);
+    ggml_cuda_mul_mat_profile_record(std::string(buf));
+}
+
+static void ggml_cuda_graph_profile_record_key(const char * state, const void * graph_key, uint64_t uid, int n_nodes) {
+    if (!ggml_cuda_mul_mat_profile_enabled()) {
+        return;
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "graph_%s key=%p uid=%" PRIu64 " n_nodes=%d", state, graph_key, uid, n_nodes);
+    ggml_cuda_mul_mat_profile_record(std::string(buf));
+}
+
+static void ggml_cuda_graph_profile_record_change(const char * reason, int node, int src, int n_nodes) {
+    if (!ggml_cuda_mul_mat_profile_enabled()) {
+        return;
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "graph_change=%s node=%d src=%d n_nodes=%d", reason, node, src, n_nodes);
+    ggml_cuda_mul_mat_profile_record(std::string(buf));
+}
+
+static void ggml_cuda_graph_profile_record_change_tensor(const char * reason, int node, const ggml_tensor * tensor, int n_nodes) {
+    if (!ggml_cuda_mul_mat_profile_enabled()) {
+        return;
+    }
+    char buf[256];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "graph_change=%s node=%d op=%s name=%s ne=%lldx%lldx%lldx%lld n_nodes=%d",
+                  reason,
+                  node,
+                  ggml_op_name(tensor->op),
+                  tensor->name,
+                  (long long) tensor->ne[0],
+                  (long long) tensor->ne[1],
+                  (long long) tensor->ne[2],
+                  (long long) tensor->ne[3],
+                  n_nodes);
+    ggml_cuda_mul_mat_profile_record(std::string(buf));
+}
+
+#endif // USE_CUDA_GRAPH
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -2538,6 +2658,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const bool profile = ggml_cuda_mul_mat_profile_enabled();
+    const char * profile_path = "unknown";
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2601,31 +2723,47 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !split && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        if (profile) {
+            profile_path = "fwht";
+            ggml_cuda_mul_mat_profile_record(ggml_cuda_mul_mat_profile_key(profile_path, src0, src1, dst));
+        }
         return;
     }
 
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        profile_path = "mmvf_direct";
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
+        profile_path = "mmf_direct";
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
+        profile_path = "mmvq_direct";
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
+        profile_path = "mmq_direct";
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         // general KQ + KQV multi-batch without FlashAttention
+        profile_path = "cublas_batched";
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {
+        profile_path = "mmvf_split";
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
+        profile_path = "mmvq_split";
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
+        profile_path = "mmq_split";
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
+        profile_path = "cublas_split";
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+    }
+    if (profile) {
+        ggml_cuda_mul_mat_profile_record(ggml_cuda_mul_mat_profile_key(profile_path, src0, src1, dst));
     }
 }
 
@@ -2951,6 +3089,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_UPSCALE:
             ggml_cuda_op_upscale(ctx, dst);
+            break;
+        case GGML_OP_GRID_SAMPLE_2D:
+            ggml_cuda_op_grid_sample_2d(ctx, dst);
             break;
         case GGML_OP_PAD:
             ggml_cuda_op_pad(ctx, dst);
@@ -3311,6 +3452,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        ggml_cuda_graph_profile_record_change("node_count", -1, -1, cgraph->n_nodes);
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -3328,6 +3470,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res) {
+                ggml_cuda_graph_profile_record_change_tensor("node_or_src_properties", i, cgraph->nodes[i], cgraph->n_nodes);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4472,14 +4617,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
+    ggml_cuda_graph_profile_record_key("key", graph_key, cgraph->uid, cgraph->n_nodes);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        ggml_cuda_graph_profile_record(graph_compatible ? "compatible" : "incompatible", cgraph->n_nodes);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            ggml_cuda_graph_profile_record(properties_changed ? "properties_changed" : "properties_same", cgraph->n_nodes);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4488,20 +4636,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    ggml_cuda_graph_profile_record("warmup_capture", cgraph->n_nodes);
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+                else {
+                    ggml_cuda_graph_profile_record("warmup_direct", cgraph->n_nodes);
+                }
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    ggml_cuda_graph_profile_record("properties_reset", cgraph->n_nodes);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    ggml_cuda_graph_profile_record(cuda_graph_update_required ? "replay_needs_instance" : "replay", cgraph->n_nodes);
                 }
             }
         }
+    } else {
+        ggml_cuda_graph_profile_record("disabled", cgraph->n_nodes);
     }
 #endif // USE_CUDA_GRAPH
 
@@ -5401,6 +5557,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PAD:
             return true;
         case GGML_OP_UPSCALE:
+        case GGML_OP_GRID_SAMPLE_2D:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:

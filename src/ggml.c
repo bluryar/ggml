@@ -1078,9 +1078,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "GRID_SAMPLE_2D",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1190,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "grid_sample_2d(input, grid)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5037,6 +5041,34 @@ struct ggml_tensor * ggml_interpolate(
         int64_t               ne3,
         uint32_t              mode) {
     return ggml_interpolate_impl(ctx, a, ne0, ne1, ne2, ne3, mode);
+}
+
+struct ggml_tensor * ggml_grid_sample_2d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * grid,
+        enum ggml_grid_sample_mode    mode,
+        enum ggml_grid_sample_padding padding,
+        bool                  align_corners) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(grid->type  == GGML_TYPE_F32);
+    GGML_ASSERT(mode == GGML_GRID_SAMPLE_MODE_BILINEAR);
+    GGML_ASSERT(padding == GGML_GRID_SAMPLE_PADDING_ZEROS);
+    GGML_ASSERT(grid->ne[0] == 2);
+    GGML_ASSERT(grid->ne[3] == input->ne[3]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            grid->ne[1], grid->ne[2], input->ne[2], input->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) mode);
+    ggml_set_op_params_i32(result, 1, (int32_t) padding);
+    ggml_set_op_params_i32(result, 2, align_corners ? 1 : 0);
+
+    result->op     = GGML_OP_GRID_SAMPLE_2D;
+    result->src[0] = input;
+    result->src[1] = grid;
+
+    return result;
 }
 
 // ggml_pad
